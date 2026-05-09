@@ -3,23 +3,45 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Security.Principal;
 using System.Text;
 using System.Windows;
+using Microsoft.Win32.SafeHandles;
 using Microsoft.Win32;
 
 namespace ProcessLockInspector;
 
+[SupportedOSPlatform("windows")]
 public partial class MainWindow : Window
 {
     private readonly ObservableCollection<LockingProcessViewModel> _lockingProcesses = [];
+    private readonly bool _isRunningAsAdministrator;
 
     public MainWindow()
     {
         InitializeComponent();
         ProcessGrid.ItemsSource = _lockingProcesses;
+        _isRunningAsAdministrator = IsRunningAsAdministrator();
         AppendStatus("Ready.");
-        AppendStatus(IsRunningAsAdministrator() ? "Running as Administrator." : "Running without Administrator rights.");
+
+        if (_isRunningAsAdministrator)
+        {
+            AppendStatus("Running as Administrator.");
+            if (PrivilegeManager.TryEnableDebugPrivilege(out var detail))
+            {
+                AppendStatus($"SeDebugPrivilege enabled ({detail}).");
+            }
+            else
+            {
+                AppendStatus($"Could not enable SeDebugPrivilege ({detail}).");
+            }
+        }
+        else
+        {
+            AppendStatus("Running without Administrator rights.");
+        }
+
         UpdateSummary();
     }
 
@@ -197,7 +219,39 @@ public partial class MainWindow : Window
         catch (UnauthorizedAccessException ex)
         {
             AppendStatus($"Lock scan failed: {ex.Message}");
-            if (!IsRunningAsAdministrator())
+
+            if (HandleScanner.TryGetLockingProcesses(targetPath, out var handleProcesses, out var handleMessage))
+            {
+                _lockingProcesses.Clear();
+                foreach (var process in handleProcesses.OrderBy(p => p.ProcessName))
+                {
+                    _lockingProcesses.Add(process);
+                }
+
+                if (_lockingProcesses.Count == 0)
+                {
+                    AppendStatus("Handle fallback succeeded. No locking processes found.");
+                }
+                else
+                {
+                    AppendStatus($"Handle fallback succeeded. Found {_lockingProcesses.Count} locking process(es).");
+                }
+
+                if (!string.IsNullOrWhiteSpace(handleMessage))
+                {
+                    AppendStatus(handleMessage);
+                }
+
+                UpdateSummary();
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(handleMessage))
+            {
+                AppendStatus(handleMessage);
+            }
+
+            if (!_isRunningAsAdministrator)
             {
                 AppendStatus("Tip: relaunch the app as Administrator for protected/system processes.");
                 var result = MessageBox.Show(
@@ -211,6 +265,10 @@ public partial class MainWindow : Window
                 {
                     RestartAsAdministrator();
                 }
+            }
+            else
+            {
+                AppendStatus("Even elevated admin can be blocked by protected processes (PPL/System). Try closing obvious apps first, then rescan.");
             }
         }
         catch (Exception ex)
@@ -381,6 +439,7 @@ public sealed class LockingProcessViewModel : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
 }
 
+ [SupportedOSPlatform("windows")]
 internal static class RestartManager
 {
     private const int ErrorSuccess = 0;
@@ -421,6 +480,12 @@ internal static class RestartManager
 
             if (listResult == ErrorAccessDenied)
             {
+                var fallback = TryGetLockingProcessesFromFileHandle(path);
+                if (fallback.Count > 0)
+                {
+                    return fallback;
+                }
+
                 throw new UnauthorizedAccessException("Access denied while enumerating locking processes (error 5). Try running as Administrator.");
             }
 
@@ -435,6 +500,12 @@ internal static class RestartManager
 
             if (listResult == ErrorAccessDenied)
             {
+                var fallback = TryGetLockingProcessesFromFileHandle(path);
+                if (fallback.Count > 0)
+                {
+                    return fallback;
+                }
+
                 throw new UnauthorizedAccessException("Access denied while reading process lock details (error 5). Try running as Administrator.");
             }
 
@@ -490,6 +561,102 @@ internal static class RestartManager
         };
     }
 
+    private static IReadOnlyList<LockingProcessViewModel> TryGetLockingProcessesFromFileHandle(string path)
+    {
+        var isDirectory = Directory.Exists(path);
+        const int fileReadAttributes = 0x80;
+        const int shareRead = 0x1;
+        const int shareWrite = 0x2;
+        const int shareDelete = 0x4;
+        const int openExisting = 3;
+        const int fileFlagBackupSemantics = 0x02000000;
+        const int fileInfoClassProcessIdsUsingFile = 47;
+
+        var flags = isDirectory ? fileFlagBackupSemantics : 0;
+
+        using var handle = NativeMethods.CreateFile(
+            path,
+            fileReadAttributes,
+            shareRead | shareWrite | shareDelete,
+            IntPtr.Zero,
+            openExisting,
+            flags,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid)
+        {
+            return [];
+        }
+
+        var buffer = new byte[64 * 1024];
+        if (!NativeMethods.GetFileInformationByHandleEx(
+                handle,
+                fileInfoClassProcessIdsUsingFile,
+                buffer,
+                (uint)buffer.Length))
+        {
+            return [];
+        }
+
+        var processCount = BitConverter.ToUInt32(buffer, 0);
+        var processIds = new HashSet<int>();
+        var offset = IntPtr.Size == 8 ? 8 : 4;
+        var stride = IntPtr.Size;
+
+        for (var i = 0; i < processCount; i++)
+        {
+            if (offset + stride > buffer.Length)
+            {
+                break;
+            }
+
+            long pid = IntPtr.Size == 8
+                ? BitConverter.ToInt64(buffer, offset)
+                : BitConverter.ToInt32(buffer, offset);
+
+            if (pid is > 0 and <= int.MaxValue)
+            {
+                processIds.Add((int)pid);
+            }
+
+            offset += stride;
+        }
+
+        var results = new List<LockingProcessViewModel>(processIds.Count);
+        foreach (var pid in processIds.OrderBy(x => x))
+        {
+            var model = new LockingProcessViewModel
+            {
+                ProcessId = pid,
+                AppType = "HandleOwner",
+                ProcessName = "Unknown",
+                MainWindowTitle = string.Empty,
+                ExecutablePath = string.Empty
+            };
+
+            try
+            {
+                using var process = Process.GetProcessById(pid);
+                model = new LockingProcessViewModel
+                {
+                    ProcessId = pid,
+                    AppType = "HandleOwner",
+                    ProcessName = process.ProcessName,
+                    MainWindowTitle = process.MainWindowTitle,
+                    ExecutablePath = process.MainModule?.FileName ?? string.Empty
+                };
+            }
+            catch
+            {
+                // Process may have exited or may not be queryable.
+            }
+
+            results.Add(model);
+        }
+
+        return results;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct RmUniqueProcess
     {
@@ -535,6 +702,24 @@ internal static class RestartManager
 
     private static class NativeMethods
     {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern SafeFileHandle CreateFile(
+            string lpFileName,
+            int dwDesiredAccess,
+            int dwShareMode,
+            IntPtr lpSecurityAttributes,
+            int dwCreationDisposition,
+            int dwFlagsAndAttributes,
+            IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle hFile,
+            int fileInfoClass,
+            [Out] byte[] lpFileInformation,
+            uint dwBufferSize);
+
         [DllImport("rstrtmgr", CharSet = CharSet.Unicode)]
         public static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, StringBuilder strSessionKey);
 
@@ -561,6 +746,7 @@ internal static class RestartManager
     }
 }
 
+ [SupportedOSPlatform("windows")]
 internal static class NativeMethods
 {
     public const int MoveFileReplaceExisting = 0x00000001;
@@ -568,4 +754,258 @@ internal static class NativeMethods
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+}
+
+ [SupportedOSPlatform("windows")]
+internal static class PrivilegeManager
+{
+    private const uint TokenAdjustPrivileges = 0x0020;
+    private const uint TokenQuery = 0x0008;
+    private const uint SePrivilegeEnabled = 0x00000002;
+    private const int ErrorNotAllAssigned = 1300;
+
+    public static bool TryEnableDebugPrivilege(out string detail)
+    {
+        detail = string.Empty;
+
+        var processHandle = NativeMethods.GetCurrentProcess();
+        if (!NativeMethods.OpenProcessToken(processHandle, TokenAdjustPrivileges | TokenQuery, out var tokenHandle))
+        {
+            detail = $"OpenProcessToken failed ({Marshal.GetLastWin32Error()})";
+            return false;
+        }
+
+        try
+        {
+            if (!NativeMethods.LookupPrivilegeValue(null, "SeDebugPrivilege", out var luid))
+            {
+                detail = $"LookupPrivilegeValue failed ({Marshal.GetLastWin32Error()})";
+                return false;
+            }
+
+            var tokenPrivileges = new TokenPrivileges
+            {
+                PrivilegeCount = 1,
+                Privileges = new LuidAndAttributes
+                {
+                    Luid = luid,
+                    Attributes = SePrivilegeEnabled
+                }
+            };
+
+            NativeMethods.SetLastError(0);
+            if (!NativeMethods.AdjustTokenPrivileges(tokenHandle, false, ref tokenPrivileges, 0, IntPtr.Zero, IntPtr.Zero))
+            {
+                detail = $"AdjustTokenPrivileges failed ({Marshal.GetLastWin32Error()})";
+                return false;
+            }
+
+            var error = Marshal.GetLastWin32Error();
+            if (error == ErrorNotAllAssigned)
+            {
+                detail = "SeDebugPrivilege not assigned to token";
+                return false;
+            }
+
+            detail = "token adjusted";
+            return true;
+        }
+        finally
+        {
+            _ = NativeMethods.CloseHandle(tokenHandle);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Luid
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LuidAndAttributes
+    {
+        public Luid Luid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenPrivileges
+    {
+        public uint PrivilegeCount;
+        public LuidAndAttributes Privileges;
+    }
+
+    private static class NativeMethods
+    {
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern void SetLastError(int dwErrorCode);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool LookupPrivilegeValue(string? lpSystemName, string lpName, out Luid lpLuid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool AdjustTokenPrivileges(
+            IntPtr tokenHandle,
+            [MarshalAs(UnmanagedType.Bool)] bool disableAllPrivileges,
+            ref TokenPrivileges newState,
+            int bufferLength,
+            IntPtr previousState,
+            IntPtr returnLength);
+    }
+}
+
+ [SupportedOSPlatform("windows")]
+internal static class HandleScanner
+{
+    public static bool TryGetLockingProcesses(string targetPath, out IReadOnlyList<LockingProcessViewModel> processes, out string message)
+    {
+        processes = [];
+        message = string.Empty;
+
+        var handleExePath = FindHandleExePath();
+        if (string.IsNullOrWhiteSpace(handleExePath) || !File.Exists(handleExePath))
+        {
+            message = "Handle fallback unavailable (handle64.exe not found). Install with: winget install --id Microsoft.Sysinternals.Handle --exact";
+            return false;
+        }
+
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = handleExePath,
+                Arguments = $"-accepteula \"{targetPath}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                message = "Failed to start handle64.exe fallback process.";
+                return false;
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            var errors = process.StandardError.ReadToEnd();
+            process.WaitForExit(10000);
+
+            if (!string.IsNullOrWhiteSpace(errors))
+            {
+                message = $"Handle fallback stderr: {errors.Trim()}";
+            }
+
+            var parsed = ParseHandleOutput(output);
+            if (parsed.Count == 0)
+            {
+                processes = [];
+                message = "Handle fallback found no lock owners.";
+                return true;
+            }
+
+            processes = parsed;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            message = $"Handle fallback failed: {ex.Message}";
+            return false;
+        }
+    }
+
+    private static string FindHandleExePath()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var basePath = Path.Combine(localAppData, "Microsoft", "WinGet", "Packages", "Microsoft.Sysinternals.Handle_Microsoft.Winget.Source_8wekyb3d8bbwe");
+        var preferred = Path.Combine(basePath, "handle64.exe");
+        if (File.Exists(preferred))
+        {
+            return preferred;
+        }
+
+        var fallback = Path.Combine(basePath, "handle.exe");
+        if (File.Exists(fallback))
+        {
+            return fallback;
+        }
+
+        return string.Empty;
+    }
+
+    private static IReadOnlyList<LockingProcessViewModel> ParseHandleOutput(string output)
+    {
+        var result = new Dictionary<int, LockingProcessViewModel>();
+        var lines = output.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var rawLine in lines)
+        {
+            var line = rawLine.Trim();
+            var pidMarker = "pid:";
+            var pidIndex = line.IndexOf(pidMarker, StringComparison.OrdinalIgnoreCase);
+            if (pidIndex <= 0)
+            {
+                continue;
+            }
+
+            var processName = line[..pidIndex].Trim();
+            var pidSection = line[(pidIndex + pidMarker.Length)..].TrimStart();
+            var pidToken = pidSection.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (!int.TryParse(pidToken, out var pid) || pid <= 0)
+            {
+                continue;
+            }
+
+            if (result.ContainsKey(pid))
+            {
+                continue;
+            }
+
+            var model = new LockingProcessViewModel
+            {
+                ProcessId = pid,
+                ProcessName = processName,
+                AppType = "HandleExe",
+                MainWindowTitle = string.Empty,
+                ExecutablePath = string.Empty
+            };
+
+            try
+            {
+                using var process = Process.GetProcessById(pid);
+                model = new LockingProcessViewModel
+                {
+                    ProcessId = pid,
+                    ProcessName = process.ProcessName,
+                    AppType = "HandleExe",
+                    MainWindowTitle = process.MainWindowTitle,
+                    ExecutablePath = process.MainModule?.FileName ?? string.Empty
+                };
+            }
+            catch
+            {
+                // Keep parsed defaults when process inspection is unavailable.
+            }
+
+            result[pid] = model;
+        }
+
+        return result.Values.ToList();
+    }
 }

@@ -1,0 +1,2 @@
+c:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\bin\Release\latest-publish\ProcessLockInspector.pdb
+c:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\bin\Release\latest-publish\ProcessLockInspector.exe

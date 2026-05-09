@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ProcessLockInspector")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+151d8bf6ced29550b7a111bd36a32c30e01dd2c7")]
 [assembly: System.Reflection.AssemblyProductAttribute("ProcessLockInspector")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ProcessLockInspector")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

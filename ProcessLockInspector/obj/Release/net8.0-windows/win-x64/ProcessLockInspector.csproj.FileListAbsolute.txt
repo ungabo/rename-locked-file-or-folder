@@ -478,3 +478,4 @@ C:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\obj\Release\net8.0
 C:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\obj\Release\net8.0-windows\win-x64\ProcessLockInspector.pdb
 C:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\obj\Release\net8.0-windows\win-x64\ProcessLockInspector.genruntimeconfig.cache
 C:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\obj\Release\net8.0-windows\win-x64\ref\ProcessLockInspector.dll
+C:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\obj\Release\net8.0-windows\win-x64\ProcessLockInspector.sourcelink.json
