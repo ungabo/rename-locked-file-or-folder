@@ -1,0 +1,2 @@
+C:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\bin\Release\net8.0-windows\win-x64\publish\ProcessLockInspector.pdb
+C:\Users\Gabe\Desktop\process killer app\ProcessLockInspector\bin\Release\net8.0-windows\win-x64\publish\ProcessLockInspector.exe
